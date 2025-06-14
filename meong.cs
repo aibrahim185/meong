@@ -1,19 +1,21 @@
 using System;
+using System.IO;
 using System.Linq;
 using System.Drawing;
 using System.Collections.Generic;
+using System.Text.Json;
 using Robocode.TankRoyale.BotApi;
 using Robocode.TankRoyale.BotApi.Events;
 
 // --------------------------------------------------------------------------------------------
 // meong 😼
 // --------------------------------------------------------------------------------------------
-// Targeting: Pattern Matching with Boyer-Moore
+// Targeting: Multi-Length Pattern Matching with Boyer-Moore (with persistent memory)
 // Movement: Anti-Gravity & Stop and Go
 // --------------------------------------------------------------------------------------------
 /*
 
-🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈
+🐈🐈�🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈🐈
 
 ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣠⣤⣤⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
 ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣠⣶⣿⠟⠉⠉⠻⣿⡄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
@@ -71,8 +73,8 @@ public class Meong : Bot
     private readonly static double  SAG_ENEMY_DISTANCE_THRESHOLD = 250;
     private readonly static double  SAG_CORNER_DISTANCE_THRESHOLD = 80;
     private readonly static int     SAG_LIMIT = 3;
-    private readonly static int     PATTERN_LENGTH = 15; // Length of the pattern to match
-    private readonly static int     MIN_PATTERN_LENGTH = 5; // Minimum length for matching
+    private readonly static int     PATTERN_LENGTH = 30;
+    private readonly static int     MIN_PATTERN_LENGTH = 5;
     private readonly static int     BULLET_OFFSET_ARENA = 50;
     private readonly static int     ENEMY_GRAVITY_CONSTANT = 300;
     private readonly static int     BULLET_GRAVITY_CONSTANT = 10;
@@ -84,6 +86,7 @@ public class Meong : Bot
     // Global variables
     static double ArenaDiagonal;
     static int targetId;
+    static string targetName;
     static double targetDistance;
     static double enemyDistance;
     static double pifDir;
@@ -94,10 +97,14 @@ public class Meong : Bot
     static int sag = 1;
     static int hitsag;
     static bool dontsag;
+    
+    // Static variable to hold data across rounds
+    static Dictionary<string, EnemyData> enemyDataByName = new Dictionary<string, EnemyData>();
+    static Dictionary<int, string> enemyIdToName = new Dictionary<int, string>();
+    static bool isDataLoaded = false;
+
 
     Random rand = new Random();
-
-    static Dictionary<int, EnemyData> enemyData = new Dictionary<int, EnemyData>();
 
     static List<Bullet> bullets;
     static List<MyBullet> myBullets;
@@ -121,7 +128,8 @@ public class Meong : Bot
         AdjustGunForBodyTurn = true;
         AdjustRadarForGunTurn = true;
         AdjustRadarForBodyTurn = true;
-
+        
+        targetId = -1; 
         targetDistance = double.PositiveInfinity;
         enemyDistance = double.PositiveInfinity;
         bullets = new List<Bullet>();
@@ -129,6 +137,25 @@ public class Meong : Bot
         dontsag = false;
         hitsag = 0;
         pifDir = 0;
+        
+        if (!isDataLoaded)
+        {
+            LoadAllPatterns();
+            isDataLoaded = true;
+        }
+
+        // Clear per-round data
+        enemyIdToName.Clear();
+        foreach(var data in enemyDataByName.Values)
+        {
+            data.ResetForNewRound();
+        }
+    }
+    
+    public override void OnGameEnded(GameEndedEvent e)
+    {
+        Console.WriteLine("Game ended. Saving patterns...");
+        SaveAllPatterns();
     }
 
     public override void OnTick(TickEvent e)
@@ -138,8 +165,6 @@ public class Meong : Bot
             Bullet bullet = bullets[i];
             bullet.X += bullet.Speed * Math.Cos(bullet.Direction);
             bullet.Y += bullet.Speed * Math.Sin(bullet.Direction);
-            // Graphics.DrawEllipse(new Pen(Color.Black), (float)bullet.X, (float)bullet.Y, 
-            //             (float)(3 * bullet.Power), (float)(3 * bullet.Power));
 
             if (bullet.X < 0 - BULLET_OFFSET_ARENA || bullet.X > ArenaWidth + BULLET_OFFSET_ARENA || 
                 bullet.Y < 0 - BULLET_OFFSET_ARENA || bullet.Y > ArenaHeight + BULLET_OFFSET_ARENA)
@@ -154,23 +179,22 @@ public class Meong : Bot
 
         for (int i = myBullets.Count - 1; i >= 0; i--)
         {
-            Bullet bullet = myBullets[i].BulletData;
+            MyBullet myBullet = myBullets[i];
+            Bullet bullet = myBullet.BulletData;
             bullet.X += bullet.Speed * Math.Cos(bullet.Direction);
             bullet.Y += bullet.Speed * Math.Sin(bullet.Direction);
-            // Graphics.DrawEllipse(myBullets[i].Type == 0 ? new Pen(Color.Orange) : new Pen(Color.Red), 
-            //             (float)bullet.X, (float)bullet.Y, 
-            //             (float)(3 * bullet.Power), (float)(3 * bullet.Power));
+            
+            EnemyData data = GetEnemyDataById(myBullet.Target);
 
-            EnemyData data = enemyData[myBullets[i].Target];
-            if (distance(data.LastX, data.LastY, bullet.X, bullet.Y) < ENEMY_RADIUS)
+            if (data != null && distance(data.LastX, data.LastY, bullet.X, bullet.Y) < ENEMY_RADIUS)
             {
-                data.Type[myBullets[i].Type] += 3 + (myBullets[i].Type == 0 ? 2 : 0);
+                data.Type[myBullet.Type] += 3 + (myBullet.Type == 0 ? 2 : 0);
                 myBullets.RemoveAt(i);
             }
             else if (bullet.X < 0 - BULLET_OFFSET_ARENA || bullet.X > ArenaWidth + BULLET_OFFSET_ARENA || 
                 bullet.Y < 0 - BULLET_OFFSET_ARENA || bullet.Y > ArenaHeight + BULLET_OFFSET_ARENA)
             {
-                data.Type[myBullets[i].Type]--;
+                if (data != null) data.Type[myBullet.Type]--;
                 myBullets.RemoveAt(i);
             }
             else 
@@ -246,12 +270,17 @@ public class Meong : Bot
 
     public override void OnScannedBot(ScannedBotEvent e)
     {
-        // Update enemy data
-        if (!enemyData.ContainsKey(e.ScannedBotId))
+        string botName = e.ScannedBotId.ToString();
+        if (!enemyDataByName.ContainsKey(botName))
         {
-            enemyData[e.ScannedBotId] = new EnemyData();
+            enemyDataByName[botName] = new EnemyData(botName);
         }
-        EnemyData data = enemyData[e.ScannedBotId];
+        if (!enemyIdToName.ContainsKey(e.ScannedBotId))
+        {
+            enemyIdToName[e.ScannedBotId] = botName;
+        }
+        
+        EnemyData data = enemyDataByName[botName];
         data.LastX = e.X;
         data.LastY = e.Y;
         data.IsAlive = true;
@@ -265,13 +294,14 @@ public class Meong : Bot
         data.HasPrevious = true;
         
         State currentState = new State(angularVelocity, currentSpeed, acceleration);
-        data.MovementHistory.Add(currentState);
+        data.CurrentGameMovementHistory.Add(currentState);
 
-        // Lock closest target
+        EnemyData currentTargetData = GetEnemyDataById(targetId);
         double scannedDistance = enemyDistance = DistanceTo(e.X, e.Y);
-        if (scannedDistance < targetDistance)
+        if (targetId == -1 || scannedDistance < targetDistance || (currentTargetData != null && !currentTargetData.IsAlive))
         {
             targetId = e.ScannedBotId;
+            targetName = botName;
         }
         else if (e.ScannedBotId != targetId && GunHeat != 0)
         {
@@ -322,35 +352,32 @@ public class Meong : Bot
             }
         }
 
-        // Head-on fallback
-        int headon = data.Type.IndexOf(data.Type.Max());
-        if (headon != 0)
-        {
-            BulletColor = Color.Red;
-            SetTurnGunLeft(GunBearingTo(e.X, e.Y));
-        }
-
-        // --- Boyer-Moore Pattern Matching ---
+        // --- Multi-Length Boyer-Moore Pattern Matching ---
         List<State> predictionSequence = new List<State>();
         
-        if (data.MovementHistory.Count > PATTERN_LENGTH)
+        // Loop from the longest pattern length down to the minimum
+        for (int len = PATTERN_LENGTH; len >= MIN_PATTERN_LENGTH; len--)
         {
-            // 1. Define the pattern from the most recent movements
-            var pattern = data.MovementHistory.GetRange(data.MovementHistory.Count - PATTERN_LENGTH, PATTERN_LENGTH).ToArray();
-
-            // 2. Search for this pattern in the history (excluding the current instance)
-            var historyToSearch = data.MovementHistory.GetRange(0, data.MovementHistory.Count - PATTERN_LENGTH).ToArray();
-
-            int matchIndex = BoyerMoore.Search(historyToSearch, pattern);
-
-            // 3. If a match is found, use the following sequence as a prediction
-            if (matchIndex != -1)
+            if (data.CurrentGameMovementHistory.Count > len)
             {
-                int predictionStartIndex = matchIndex + pattern.Length;
-                int predictionLength = Math.Min(100, data.MovementHistory.Count - predictionStartIndex); // Predict up to 100 ticks
-                if (predictionLength > 0)
+                // 1. Define the pattern of current length
+                var pattern = data.CurrentGameMovementHistory.GetRange(data.CurrentGameMovementHistory.Count - len, len).ToArray();
+
+                // 2. Combine historical and current game data to search in
+                var historyToSearch = data.HistoricalMovement.Concat(data.CurrentGameMovementHistory.Take(data.CurrentGameMovementHistory.Count - len)).ToArray();
+
+                int matchIndex = BoyerMoore.Search(historyToSearch, pattern);
+
+                // 3. If a match is found, use it and stop searching for shorter patterns
+                if (matchIndex != -1)
                 {
-                    predictionSequence = data.MovementHistory.GetRange(predictionStartIndex, predictionLength);
+                    int predictionStartIndex = matchIndex + pattern.Length;
+                    int predictionLength = Math.Min(100, historyToSearch.Length - predictionStartIndex);
+                    if (predictionLength > 0)
+                    {
+                        predictionSequence = historyToSearch.Skip(predictionStartIndex).Take(predictionLength).ToList();
+                    }
+                    break; 
                 }
             }
         }
@@ -377,8 +404,7 @@ public class Meong : Bot
                 }
                 else
                 {
-                    // If prediction runs out, continue with last known values (or stop)
-                    weight *= 0.1; // Reduce confidence if we run out of data
+                    weight *= 0.1; 
                 }
 
                 predictedX += predictedSpeed * Math.Cos(predictedDirection);
@@ -406,32 +432,27 @@ public class Meong : Bot
                 bestAngle = i;
             }
         }
-
-        // If no predictions were successful, fall back to head-on
-        if (maxScore <= 0)
+        
+        int headon = data.Type.IndexOf(data.Type.Max());
+        if (maxScore <= 0 || headon != 0)
         {
-            BulletColor = Color.Red;
             SetTurnGunLeft(GunBearingTo(e.X, e.Y));
+            if (headon != 0) BulletColor = Color.Red;
         }
         else
         {
-            BulletColor = Color.White;
             bestAngle = bestAngle * 360 / ANGLE_BINS;
             pifDir = toRad(bestAngle + GunDirection);
-            if (headon == 0)
-            {
-                SetTurnGunLeft(NormalizeRelativeAngle(bestAngle));
-            }
+            SetTurnGunLeft(NormalizeRelativeAngle(bestAngle));
         }
 
         // Update other enemy positions
-        foreach (var enemy in enemyData)
+        foreach (var enemy in enemyDataByName.Values)
         {
-            if (enemy.Key != targetId && enemy.Value.IsAlive)
+            if (enemy.IsAlive && enemy.Name != targetName)
             {
-                EnemyData ed = enemy.Value;
-                ed.LastX += ed.LastSpeed * Math.Cos(ed.LastDirection);
-                ed.LastY += ed.LastSpeed * Math.Sin(ed.LastDirection);
+                enemy.LastX += enemy.LastSpeed * Math.Cos(enemy.LastDirection);
+                enemy.LastY += enemy.LastSpeed * Math.Sin(enemy.LastDirection);
             }
         }
     }
@@ -440,9 +461,12 @@ public class Meong : Bot
     public override void OnBulletFired(BulletFiredEvent e)
     {
         AddMyVirtualBullet(X, Y, e.Bullet.Speed, e.Bullet.Power, pifDir, targetId, 0);
-        EnemyData data = enemyData[targetId];
-        AddMyVirtualBullet(X, Y, e.Bullet.Speed, e.Bullet.Power, 
-                        toRad(DirectionTo(data.LastX, data.LastY)), targetId, 1);
+        EnemyData data = GetEnemyDataById(targetId);
+        if (data != null)
+        {
+            AddMyVirtualBullet(X, Y, e.Bullet.Speed, e.Bullet.Power, 
+                            toRad(DirectionTo(data.LastX, data.LastY)), targetId, 1);
+        }
     }
 
     public override void OnHitByBullet(HitByBulletEvent e)
@@ -455,11 +479,13 @@ public class Meong : Bot
 
     public override void OnBotDeath(BotDeathEvent e)
     {
-        enemyData[e.VictimId].IsAlive = false;
+        EnemyData data = GetEnemyDataById(e.VictimId);
+        data?.IsAlive = false;
         
         if (e.VictimId == targetId)
         {
             targetDistance = double.PositiveInfinity;
+            targetId = -1;
         }
     }
 
@@ -467,8 +493,7 @@ public class Meong : Bot
     private double CalcGrav(double candidateX, double candidateY)
     {
         double grav = 0;
-
-        foreach (EnemyData enemy in enemyData.Values)
+        foreach (EnemyData enemy in enemyDataByName.Values)
         {
             if (enemy.IsAlive)
             {
@@ -488,13 +513,14 @@ public class Meong : Bot
             
             double d = bulletLine.DistanceToPoint(candidateX, candidateY);
             grav += BULLET_GRAVITY_CONSTANT * bullet.Power / (d * d + MIN_DIVISOR);
-
         }
 
         grav += LAST_LOC_GRAVITY_CONSTANT * rand.NextDouble() / 
                 (Math.Pow(DistanceTo(candidateX, candidateY), 2) + MIN_DIVISOR);
-        if (targetId != 0 && enemyData.ContainsKey(targetId))
-            grav += targetDistance - DistanceTo(enemyData[targetId].LastX, enemyData[targetId].LastY);
+        
+        EnemyData targetData = GetEnemyDataById(targetId);
+        if (targetData != null)
+            grav += targetDistance - DistanceTo(targetData.LastX, targetData.LastY);
             
         grav += CORNER_CONSTANT / distanceSq(candidateX, candidateY, 0, 0);
         grav += CORNER_CONSTANT / distanceSq(candidateX, candidateY, 0, ArenaHeight);
@@ -506,15 +532,7 @@ public class Meong : Bot
     
     private void AddVirtualBullet(double x, double y, double speed, double power, double direction)
     {
-        Bullet bullet = new Bullet
-        {
-            Speed = speed,
-            Direction = direction,
-            X = x + 2 * speed * Math.Cos(direction),
-            Y = y + 2 * speed * Math.Sin(direction),
-            Power = power
-        };
-        bullets.Add(bullet);
+        bullets.Add(new Bullet { Speed = speed, Direction = direction, X = x + 2 * speed * Math.Cos(direction), Y = y + 2 * speed * Math.Sin(direction), Power = power });
     }
         
     private void AddLinearVirtualBullet(double x, double y, double speed, double power)
@@ -529,170 +547,162 @@ public class Meong : Bot
         double b = 2 * (vxt * (xt - x) + vyt * (yt - y));
         double c = Math.Pow(xt - x, 2) + Math.Pow(yt - y, 2);
         double d = Math.Pow(b, 2) - 4 * a * c;
-        if (d < 0) return; // No real solution
+        if (d < 0) return;
         double t1 = (-b + Math.Sqrt(d)) / (2 * a);
         double t2 = (-b - Math.Sqrt(d)) / (2 * a);
         double t = Math.Min(Math.Max(0, t1), Math.Max(0, t2));
         double predictedX = xt + vxt * t;
         double predictedY = yt + vyt * t;
         double linearDirection = Math.Atan2(predictedY - y, predictedX - x);
-        Bullet bulletLinear = new Bullet
-        {
-            Speed = speed,
-            Direction = linearDirection,
-            X = x + 2 * speed * Math.Cos(linearDirection),
-            Y = y + 2 * speed * Math.Sin(linearDirection),
-            Power = power * 2
-        };
-        bullets.Add(bulletLinear);
+        bullets.Add(new Bullet { Speed = speed, Direction = linearDirection, X = x + 2 * speed * Math.Cos(linearDirection), Y = y + 2 * speed * Math.Sin(linearDirection), Power = power * 2 });
     }
 
     private void AddMyVirtualBullet(double x, double y, double speed, double power, double direction, int target, int type)
     {
-        MyBullet myBullet = new MyBullet
-        (
-            x + 2 * speed * Math.Cos(direction),
-            y + 2 * speed * Math.Sin(direction),
-            speed,
-            direction,
-            power,
-            target,
-            type
-        );
-        myBullets.Add(myBullet);
+        if (target == -1) return;
+        myBullets.Add(new MyBullet(x + 2 * speed * Math.Cos(direction), y + 2 * speed * Math.Sin(direction), speed, direction, power, target, type));
     }
     
-    public double distanceSq(double x1, double y1, double x2, double y2)
+    private void SaveAllPatterns()
     {
-        return Math.Pow(x1 - x2, 2) + Math.Pow(y1 - y2, 2);
+        string dir = "patterns";
+        Directory.CreateDirectory(dir);
+
+        foreach (var data in enemyDataByName.Values)
+        {
+            List<State> fullHistory = data.HistoricalMovement.Concat(data.CurrentGameMovementHistory).ToList();
+            if (fullHistory.Any())
+            {
+                string filePath = Path.Combine(dir, $"{data.Name}.json");
+                string json = JsonSerializer.Serialize(fullHistory);
+                File.WriteAllText(filePath, json);
+                Console.WriteLine($"Saved pattern for {data.Name} to {filePath}");
+            }
+        }
+    }
+    
+    private void LoadAllPatterns()
+    {
+        string dir = "patterns";
+        if (!Directory.Exists(dir)) return;
+
+        foreach (string filePath in Directory.GetFiles(dir, "*.json"))
+        {
+            try
+            {
+                string enemyName = Path.GetFileNameWithoutExtension(filePath);
+                string json = File.ReadAllText(filePath);
+                var historicalData = JsonSerializer.Deserialize<List<State>>(json);
+
+                if (!enemyDataByName.ContainsKey(enemyName))
+                {
+                    enemyDataByName[enemyName] = new EnemyData(enemyName);
+                }
+                enemyDataByName[enemyName].HistoricalMovement = historicalData ?? new List<State>();
+                Console.WriteLine($"Loaded {enemyDataByName[enemyName].HistoricalMovement.Count} historical states for {enemyName}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error loading pattern from {filePath}: {ex.Message}");
+            }
+        }
+    }
+    
+    private EnemyData GetEnemyDataById(int id)
+    {
+        if (id != -1 && enemyIdToName.TryGetValue(id, out string name) && enemyDataByName.ContainsKey(name))
+        {
+            return enemyDataByName[name];
+        }
+        return null;
     }
 
-    public double distance(double x1, double y1, double x2, double y2)
-    {
-        return Math.Sqrt(Math.Pow(x1 - x2, 2) + Math.Pow(y1 - y2, 2));
-    }
-
-    public double toRad(double degree)
-    {
-        return degree * Math.PI / 180;
-    }
-
-    public double toDeg(double radian)
-    {
-        return radian * 180 / Math.PI;
-    }
+    public double distanceSq(double x1, double y1, double x2, double y2) => Math.Pow(x1 - x2, 2) + Math.Pow(y1 - y2, 2);
+    public double distance(double x1, double y1, double x2, double y2) => Math.Sqrt(distanceSq(x1, y1, x2, y2));
+    public double toRad(double degree) => degree * Math.PI / 180;
+    public double toDeg(double radian) => radian * 180 / Math.PI;
 }
 
 public struct State : IEquatable<State>
 {
-    public int AngularVelocity; // quantized: radian * 512
-    public int Speed;           // -8 -- 8
-    public int Acceleration;    // -1 -- 1
+    public int AngularVelocity { get; set; }
+    public int Speed { get; set; }
+    public int Acceleration { get; set; }
 
     public State(double angularVelocity, double speed, double acceleration)
     {
         AngularVelocity = (int)(angularVelocity * 512);
         Speed = (int)Math.Round(speed);
-        
         double threshold = 0.1; 
-        if (acceleration < -threshold)
-            Acceleration = -1;
-        else if (acceleration > threshold)
-            Acceleration = 1;
-        else
-            Acceleration = 0;
+        if (acceleration < -threshold) Acceleration = -1;
+        else if (acceleration > threshold) Acceleration = 1;
+        else Acceleration = 0;
     }
     
-    public bool Equals(State other)
-    {
-        return AngularVelocity == other.AngularVelocity &&
-               Speed == other.Speed &&
-               Acceleration == other.Acceleration;
-    }
-
-    public override bool Equals(object obj)
-    {
-        return obj is State other && Equals(other);
-    }
-
-    public override int GetHashCode()
-    {
-        return HashCode.Combine(AngularVelocity, Speed, Acceleration);
-    }
+    public bool Equals(State other) => AngularVelocity == other.AngularVelocity && Speed == other.Speed && Acceleration == other.Acceleration;
+    public override bool Equals(object obj) => obj is State other && Equals(other);
+    public override int GetHashCode() => HashCode.Combine(AngularVelocity, Speed, Acceleration);
 }
 
 
 public class EnemyData
 {
-    // Changed StateHistory to MovementHistory for clarity
-    public List<State> MovementHistory { get; } = new List<State>();
+    public string Name { get; }
+    public List<State> HistoricalMovement { get; set; } = new List<State>();
+    public List<State> CurrentGameMovementHistory { get; } = new List<State>();
     public List<int> Type { get; set; } = new List<int> { 13 , 0 };
-    public bool HasPrevious { get; set; } = false;
-    public bool IsAlive { get; set; } = true;
+    public bool HasPrevious { get; set; }
+    public bool IsAlive { get; set; }
     public double LastDirection { get; set; }
     public double LastX { get; set; }
     public double LastY { get; set; }
-    public double LastEnergy { get; set; }
+    public double LastEnergy { get; set; } = 100;
     public double LastSpeed { get; set; }
+
+    public EnemyData(string name)
+    {
+        Name = name;
+        ResetForNewRound();
+    }
+    
+    public void ResetForNewRound()
+    {
+        CurrentGameMovementHistory.Clear();
+        IsAlive = true;
+        HasPrevious = false;
+        LastEnergy = 100;
+    }
 }
 
-// --- Boyer-Moore Implementation ---
 public static class BoyerMoore
 {
-    private static Dictionary<State, int> BuildBadCharTable(State[] pattern)
-    {
-        var badCharTable = new Dictionary<State, int>();
-        for (int i = 0; i < pattern.Length - 1; i++)
-        {
-            badCharTable[pattern[i]] = pattern.Length - 1 - i;
-        }
-        return badCharTable;
-    }
-
     public static int Search(State[] text, State[] pattern)
     {
-        if (pattern == null || pattern.Length == 0 || text == null || text.Length < pattern.Length)
-        {
-            return -1;
-        }
+        if (pattern.Length == 0 || text.Length < pattern.Length) return -1;
 
         int n = text.Length;
         int m = pattern.Length;
-        var badCharTable = BuildBadCharTable(pattern);
-        int i = m - 1;
 
-        // We search backwards from the last found instance
-        while (i < n)
+        for (int i = n - m; i >= 0; i--)
         {
-            int j = m - 1;
-            while (j >= 0 && text[i - (m - 1) + j].Equals(pattern[j]))
+            int j = 0;
+            while (j < m && text[i + j].Equals(pattern[j]))
             {
-                j--;
+                j++;
             }
-
-            if (j < 0)
+            if (j == m)
             {
-                // Found a match at index i - m + 1
-                // Return the last one found for most recent prediction
-                return i - m + 1; 
+                return i;
             }
-
-            int shift = badCharTable.GetValueOrDefault(text[i], m);
-            i += shift;
         }
-
-        return -1; // No match found
+        return -1;
     }
 }
 
 
 public struct Bullet
 {
-    public double X;
-    public double Y;
-    public double Speed;
-    public double Direction;
-    public double Power;
+    public double X; public double Y; public double Speed; public double Direction; public double Power;
 }
 
 public class MyBullet
@@ -700,7 +710,6 @@ public class MyBullet
     public Bullet BulletData;
     public int Target;
     public int Type;
-
     public MyBullet(double x, double y, double speed, double direction, double power, int target, int type)
     {
         BulletData = new Bullet { X = x, Y = y, Speed = speed, Direction = direction, Power = power };
@@ -724,9 +733,7 @@ public class Line2D
         Y2 = y2;
     }
 
-    public double DistanceToPoint(double px, double py)
-    {
-        return Math.Abs((Y2 - Y1) * px - (X2 - X1) * py + (X2 * Y1 - Y2 * X1)) 
-                / Math.Sqrt(Math.Pow(Y2 - Y1, 2) + Math.Pow(X2 - X1, 2));
-    }
+    public double DistanceToPoint(double px, double py) =>
+        Math.Abs((Y2 - Y1) * px - (X2 - X1) * py + (X2 * Y1 - Y2 * X1)) /
+        Math.Sqrt(Math.Pow(Y2 - Y1, 2) + Math.Pow(X2 - X1, 2));
 }
