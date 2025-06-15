@@ -480,7 +480,10 @@ public class Meong : Bot
     public override void OnBotDeath(BotDeathEvent e)
     {
         EnemyData data = GetEnemyDataById(e.VictimId);
-        data?.IsAlive = false;
+        if (data != null)
+        {
+            data.IsAlive = false;
+        }
         
         if (e.VictimId == targetId)
         {
